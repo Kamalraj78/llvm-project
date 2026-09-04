@@ -353,7 +353,8 @@ protected:
   void notifyOperationReplaced(Operation *op, ValueRange replacement) override;
 
   /// Process ops until the worklist is empty or `config.maxNumRewrites` is
-  /// reached. Return `true` if any IR was changed.
+  /// reached. Skip operations in unreachable blocks. Return `true` if any IR
+  /// was changed.
   bool processWorklist();
 
   /// The pattern rewriter that is used for making IR modifications and is
@@ -378,6 +379,24 @@ protected:
   llvm::SmallDenseSet<Operation *, 4> strictModeFilteredOps;
 
 private:
+  struct ReachabilityState {
+    Block *entry = nullptr;
+    llvm::SmallDenseSet<Block *, 16> blocks;
+    DenseMap<Block *, SmallVector<Block *, 2>> successors;
+    llvm::SmallDenseSet<Block *, 4> changedBlocks;
+    llvm::SmallDenseSet<Block *, 4> erasedBlocks;
+    bool forceRecompute = false;
+  };
+
+  /// Listener notifications record changed blocks. Reachability is updated
+  /// when the next operation is processed, after the rewrite has completed.
+  DenseMap<Region *, ReachabilityState> reachableBlocks;
+
+  void invalidateRegion(Region *region);
+  void markBlockChanged(Region *region, Block *block);
+  void markBlockErased(Block *block);
+  bool isReachable(Operation *op);
+
   /// Look over the provided operands for any defining operations that should
   /// be re-added to the worklist. This function should be called when an
   /// operation is modified or removed, as it may trigger further
@@ -441,6 +460,9 @@ GreedyPatternRewriteDriver::GreedyPatternRewriteDriver(
 }
 
 bool GreedyPatternRewriteDriver::processWorklist() {
+  reachableBlocks.clear();
+  llvm::scope_exit clearReachability([&] { reachableBlocks.clear(); });
+
 #ifndef NDEBUG
   const char *logLineComment =
       "//===-------------------------------------------===//\n";
@@ -465,6 +487,10 @@ bool GreedyPatternRewriteDriver::processWorklist() {
          (numRewrites < config.getMaxNumRewrites() ||
           config.getMaxNumRewrites() == GreedyRewriteConfig::kNoLimit)) {
     auto *op = worklist.pop();
+    if (!isReachable(op)) {
+      LLVM_DEBUG(logger.startLine() << "Skipping unreachable operation\n");
+      continue;
+    }
 
     LLVM_DEBUG({
       logger.getOStream() << "\n";
@@ -638,6 +664,149 @@ bool GreedyPatternRewriteDriver::processWorklist() {
   return changed;
 }
 
+void GreedyPatternRewriteDriver::invalidateRegion(Region *region) {
+  if (region)
+    reachableBlocks.erase(region);
+}
+
+void GreedyPatternRewriteDriver::markBlockChanged(Region *region,
+                                                  Block *block) {
+  if (region) {
+    auto it = reachableBlocks.find(region);
+    if (it != reachableBlocks.end())
+      it->second.changedBlocks.insert(block);
+  }
+}
+
+void GreedyPatternRewriteDriver::markBlockErased(Block *block) {
+  Region *region = block->getParent();
+  if (!region)
+    return;
+  auto it = reachableBlocks.find(region);
+  if (it != reachableBlocks.end()) {
+    if (it->second.entry == block)
+      it->second.forceRecompute = true;
+    it->second.changedBlocks.insert(block);
+    it->second.erasedBlocks.insert(block);
+  }
+}
+
+static SmallVector<Block *, 2> getUniqueSuccessors(Block *block) {
+  SmallVector<Block *, 2> successors;
+  for (Block *successor :
+       llvm::make_range(block->succ_begin(), block->succ_end()))
+    if (!llvm::is_contained(successors, successor))
+      successors.push_back(successor);
+  return successors;
+}
+
+bool GreedyPatternRewriteDriver::isReachable(Operation *op) {
+  // A detached operation or block has no region entry to compare against.
+  Block *block = op->getBlock();
+  if (!block)
+    return true;
+  Region *region = block->getParent();
+  if (!region || region->hasOneBlock())
+    return true;
+
+  auto [it, inserted] = reachableBlocks.try_emplace(region);
+  ReachabilityState &state = it->second;
+  auto recompute = [&] {
+    state = ReachabilityState();
+    state.entry = &region->front();
+    SmallVector<Block *> worklist{state.entry};
+    while (!worklist.empty()) {
+      Block *reachable = worklist.pop_back_val();
+      if (!state.blocks.insert(reachable).second)
+        continue;
+      auto &successors = state.successors[reachable];
+      successors = getUniqueSuccessors(reachable);
+      worklist.append(successors);
+    }
+  };
+  if (inserted || state.forceRecompute || state.entry != &region->front()) {
+    recompute();
+  } else if (!state.changedBlocks.empty()) {
+    // Check the final CFG, after all notifications from the rewrite. Replacing
+    // a terminator without changing its successors needs no traversal. A
+    // block merge contracts an erased successor into its predecessor: if the
+    // predecessor now reaches all of the erased block's old successors, every
+    // path through that block still reaches the same surviving blocks.
+    DenseMap<Block *, SmallVector<Block *, 2>> currentSuccessors;
+    for (Block *changed : state.changedBlocks) {
+      if (!state.erasedBlocks.contains(changed) &&
+          changed->getParent() == region)
+        currentSuccessors[changed] = getUniqueSuccessors(changed);
+    }
+
+    llvm::SmallDenseSet<Block *, 4> contractedBlocks;
+    bool mustRecompute = false;
+    for (auto &entry : currentSuccessors) {
+      Block *changed = entry.first;
+      auto &current = entry.second;
+      if (!state.blocks.contains(changed))
+        continue;
+      for (Block *oldSuccessor : state.successors.lookup(changed)) {
+        if (llvm::is_contained(current, oldSuccessor))
+          continue;
+        auto old = state.successors.find(oldSuccessor);
+        if (!state.erasedBlocks.contains(oldSuccessor) ||
+            old == state.successors.end() ||
+            !llvm::all_of(old->second, [&](Block *successor) {
+              return llvm::is_contained(current, successor);
+            })) {
+          mustRecompute = true;
+          break;
+        }
+        contractedBlocks.insert(oldSuccessor);
+      }
+      if (mustRecompute)
+        break;
+    }
+    if (!mustRecompute) {
+      for (Block *changed : state.changedBlocks) {
+        if (currentSuccessors.contains(changed) ||
+            !state.blocks.contains(changed))
+          continue;
+        if (!state.erasedBlocks.contains(changed) ||
+            (!contractedBlocks.contains(changed) &&
+             !state.successors.lookup(changed).empty())) {
+          mustRecompute = true;
+          break;
+        }
+      }
+    }
+    if (mustRecompute) {
+      recompute();
+    } else {
+      // Additions can only make more blocks reachable. Visit those blocks
+      // without rescanning the already reachable part of the region.
+      for (Block *erased : state.erasedBlocks) {
+        state.blocks.erase(erased);
+        state.successors.erase(erased);
+      }
+      SmallVector<Block *> worklist;
+      for (auto &[changed, current] : currentSuccessors) {
+        if (!state.blocks.contains(changed))
+          continue;
+        state.successors[changed] = current;
+        worklist.append(current);
+      }
+      while (!worklist.empty()) {
+        Block *reachable = worklist.pop_back_val();
+        if (!state.blocks.insert(reachable).second)
+          continue;
+        auto &successors = state.successors[reachable];
+        successors = getUniqueSuccessors(reachable);
+        worklist.append(successors);
+      }
+      state.changedBlocks.clear();
+      state.erasedBlocks.clear();
+    }
+  }
+  return state.blocks.contains(block);
+}
+
 void GreedyPatternRewriteDriver::addToWorklist(Operation *op) {
   assert(op && "expected valid op");
   // Gather potential ancestors while looking for a "scope" parent region.
@@ -665,17 +834,30 @@ void GreedyPatternRewriteDriver::addSingleOpToWorklist(Operation *op) {
 
 void GreedyPatternRewriteDriver::notifyBlockInserted(
     Block *block, Region *previous, Region::iterator previousIt) {
+  markBlockChanged(previous, block);
+  markBlockChanged(block->getParent(), block);
+  if (auto it = reachableBlocks.find(block->getParent());
+      it != reachableBlocks.end() && it->second.erasedBlocks.contains(block))
+    it->second.forceRecompute = true;
   if (RewriterBase::Listener *listener = config.getListener())
     listener->notifyBlockInserted(block, previous, previousIt);
 }
 
 void GreedyPatternRewriteDriver::notifyBlockErased(Block *block) {
+  markBlockErased(block);
   if (RewriterBase::Listener *listener = config.getListener())
     listener->notifyBlockErased(block);
 }
 
 void GreedyPatternRewriteDriver::notifyOperationInserted(
     Operation *op, OpBuilder::InsertPoint previous) {
+  if (op->mightHaveTrait<OpTrait::IsTerminator>() || op->getNumSuccessors()) {
+    markBlockChanged(op->getParentRegion(), op->getBlock());
+    if (previous.isSet())
+      markBlockChanged(previous.getBlock()->getParent(), previous.getBlock());
+  }
+  for (Region &region : op->getRegions())
+    invalidateRegion(&region);
   LLVM_DEBUG({
     logger.startLine() << "** Insert  : '" << op->getName() << "'(" << op
                        << ")\n";
@@ -688,6 +870,10 @@ void GreedyPatternRewriteDriver::notifyOperationInserted(
 }
 
 void GreedyPatternRewriteDriver::notifyOperationModified(Operation *op) {
+  if (op->mightHaveTrait<OpTrait::IsTerminator>() || op->getNumSuccessors())
+    markBlockChanged(op->getParentRegion(), op->getBlock());
+  for (Region &region : op->getRegions())
+    invalidateRegion(&region);
   LLVM_DEBUG({
     logger.startLine() << "** Modified: '" << op->getName() << "'(" << op
                        << ")\n";
@@ -731,6 +917,11 @@ void GreedyPatternRewriteDriver::addOperandsToWorklist(Operation *op) {
 }
 
 void GreedyPatternRewriteDriver::notifyOperationErased(Operation *op) {
+  if (op->mightHaveTrait<OpTrait::IsTerminator>() || op->getNumSuccessors())
+    markBlockChanged(op->getParentRegion(), op->getBlock());
+  for (Region &region : op->getRegions()) {
+    reachableBlocks.erase(&region);
+  }
   LLVM_DEBUG({
     logger.startLine() << "** Erase   : '" << op->getName() << "'(" << op
                        << ")\n";

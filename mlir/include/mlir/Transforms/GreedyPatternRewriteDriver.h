@@ -255,6 +255,9 @@ applyPatternsGreedily(Operation *op, const FrozenRewritePatternSet &patterns,
 /// Also performs simple dead-code elimination before attempting to match any of
 /// the provided patterns.
 ///
+/// Operations in blocks that are unreachable from their region's entry block
+/// are skipped, even if they are explicitly listed in `ops`.
+///
 /// Newly created ops and other pre-existing ops that use results of rewritten
 /// ops or supply operands to such ops are also processed, unless such ops are
 /// excluded via `config.strictMode`. Any other ops remain unmodified (i.e.,
